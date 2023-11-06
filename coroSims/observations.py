@@ -1,0 +1,590 @@
+from pathlib import Path
+
+import astropy.units as u
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import numpy as np
+from astroutils.units.lod import lod, lod_eq
+from matplotlib.colors import LogNorm
+from scipy.ndimage import rotate, shift, zoom
+from tqdm import tqdm
+
+
+class Observations:
+    def __init__(self, coronagraph, system, observing_scenario):
+        """Class to store the parameters of an observation.
+        Args:
+            coronagraph (Coronagraph object):
+                Coronagraph object containing the coronagraph parameters
+            system (ExovistaSystem object):
+                ExovistaSystem object containing the system parameters
+            observing_scenario (dict):
+                Dictionary containing the observing scenario parameters
+
+        """
+        self.coronagraph = coronagraph
+        self.system = system
+        self.observing_scenario = observing_scenario
+
+        # Load observing scenario parameters
+        self.diameter = self.observing_scenario["diameter"]
+        self.obs_wavelengths = self.observing_scenario["wavelengths"]
+        self.obs_times = self.observing_scenario["times"]
+        self.nwavelengths = len(self.obs_wavelengths)
+        self.ntimes = len(self.obs_times)
+
+        self.include_star = self.observing_scenario.get("include_star")
+        self.include_planets = self.observing_scenario.get("include_planets")
+        self.include_disk = self.observing_scenario.get("include_disk")
+
+        # Create save directory
+        self.save_dir = Path("results", system.file.stem, coronagraph.dir.parts[-1])
+
+        # Create the images
+        self.create_count_rate_factor()
+        self.create_images()
+        self.plot_images()
+
+    def create_count_rate_factor(self):
+        self.throughput = np.repeat(
+            self.coronagraph.inst_thruput, len(self.obs_wavelengths)
+        )
+        self.illuminated_area = (
+            np.pi * self.diameter**2 / 4.0 * (1.0 - self.coronagraph.frac_obscured)
+        )
+        self.bandwidths = self.coronagraph.frac_bandwidth * self.obs_wavelengths
+        self.bandwidth_transmission_term = (
+            self.illuminated_area * self.bandwidths * self.throughput
+        )
+        self.count_rate_term = self.illuminated_area * self.bandwidths * self.throughput
+
+    def create_images(self):
+        """
+        Create the images at the wavelengths and times
+        """
+
+        self.images = (
+            np.zeros(
+                (
+                    self.ntimes,
+                    self.nwavelengths,
+                    self.coronagraph.npixels,
+                    self.coronagraph.npixels,
+                )
+            )
+            * u.ph
+            / u.s
+        )
+
+        self.star_count_rate = np.zeros_like(self.images.value) * u.ph / u.s
+        self.planet_count_rate = np.zeros_like(self.images.value) * u.ph / u.s
+        self.disk_count_rate = np.zeros_like(self.images.value) * u.ph / u.s
+        if self.include_star:
+            self.add_star()
+        if self.include_planets:
+            self.add_planets()
+        if self.include_disk:
+            self.add_disk()
+
+    def add_star(self):
+        """
+        Add a star to the system.
+        """
+        # Compute star count rate in lambda/D
+        stellar_diam_lod = self.system.star.angular_diameter.to(
+            lod, lod_eq(self.obs_wavelengths, self.diameter)
+        )
+
+        # Get the intensity map I(x,y) at the stellar diameters
+        stellar_intens = self.coronagraph.stellar_intens_interp(stellar_diam_lod).T
+
+        # Calculate the star flux density
+        star_flux_density = self.system.star.spec_flux_density(
+            self.obs_wavelengths, self.obs_times.decimalyear
+        ).to(
+            u.photon / (u.m**2 * u.s * u.nm),
+            equivalencies=u.spectral_density(self.obs_wavelengths),
+        )
+
+        # Multiply by the count rate term (A*dLambda*T)
+        flux_term = (star_flux_density * self.count_rate_term).decompose()
+
+        # Compute star count rate in each pixel
+        for i, _ in enumerate(self.obs_times):
+            self.star_count_rate[i] = np.multiply(stellar_intens, flux_term[i]).T
+        self.images += self.star_count_rate
+
+    def add_planets(self):
+        """
+        Add planets to the system.
+        """
+        # Compute planet separations and position angles.
+        xyplanet = np.zeros((len(self.system.planets), self.ntimes, 2)) * u.pixel
+        for i, planet in enumerate(self.system.planets):
+            xyplanet[i] = (
+                np.array(
+                    [
+                        planet._x_pix_interp(self.obs_times),
+                        planet._y_pix_interp(self.obs_times),
+                    ]
+                ).T
+                * u.pixel
+            )
+        xystar = (
+            np.array(
+                [
+                    self.system.star._x_pix_interp(self.obs_times),
+                    self.system.star._y_pix_interp(self.obs_times),
+                ]
+            ).T
+            * u.pixel
+        )
+
+        # plan_offs
+        planet_xy_separations = (xyplanet - xystar) * self.system.star.pixel_scale
+        planet_alphas = np.sqrt(np.sum(planet_xy_separations**2, axis=2))
+        planet_angles = np.arctan2(
+            planet_xy_separations[:, :, 0], planet_xy_separations[:, :, 1]
+        )
+
+        # Old way
+        plan_offs = planet_xy_separations.to(u.mas).value
+        plan_seps = np.sqrt(np.sum(plan_offs**2, axis=2))  # mas
+        plan_angs = np.rad2deg(np.arctan2(plan_offs[:, :, 0], plan_offs[:, :, 1]))
+
+        if self.coronagraph.position_angle != 0.0 * u.deg:
+            planet_angles += self.position_angle
+            planet_xy_separations[:, :, 0] = np.multiply(
+                planet_alphas, np.sin(planet_angles)
+            )
+            planet_xy_separations[:, :, 1] = np.multiply(
+                planet_alphas, np.cos(planet_angles)
+            )
+
+        # Compute planet flux.
+        coro_type = self.coronagraph.type
+
+        planet_flux_density = (
+            np.zeros(
+                (
+                    len(self.system.planets),
+                    len(self.obs_times),
+                    len(self.obs_wavelengths),
+                )
+            )
+            * u.Jy
+        )
+        for i, planet in enumerate(self.system.planets):
+            planet_flux_density[i] += planet.spec_flux_density(
+                self.obs_wavelengths, self.obs_times.decimalyear
+            )
+        planet_photon_flux = (
+            planet_flux_density.to(
+                u.photon / (u.m**2 * u.s * u.nm),
+                equivalencies=u.spectral_density(self.obs_wavelengths),
+            )
+            * self.count_rate_term
+        ).decompose()
+
+        wave_inv = 1.0 / self.obs_wavelengths
+        for i, planet in enumerate(tqdm(self.system.planets, desc="Adding planets")):
+            if (coro_type == "1dx") or (coro_type == "1dy"):
+                # lambda/D
+                planet_lod_alphas = np.stack(
+                    [
+                        planet_alphas[i, :].to(lod, lod_eq(wave, self.diameter))
+                        for wave in self.obs_wavelengths
+                    ]
+                ).T
+
+                # The planet's psf at each time and wavelength
+                # shape (Ntime, Nwave, Npix, Npix)
+                planet_psfs = self.coronagraph.offax_psf_interp(planet_lod_alphas)
+                rotated_psfs = np.zeros_like(planet_psfs)
+                planet_images = np.zeros_like(planet_psfs) * u.ph / u.s
+                for j, _ in enumerate(self.obs_times):
+                    # interpolate in log-space to avoid negative values
+                    rotated_psfs[j] = np.exp(
+                        rotate(
+                            np.log(planet_psfs[j]),
+                            plan_angs[i, j] - 90.0,
+                            axes=(1, 2),
+                            reshape=False,
+                            mode="nearest",
+                            order=5,
+                        )
+                    )
+                    # ph/s
+                    # self.scene.fplanet[i, j] * self.oneJ_count_rate,
+                    planet_images[j] = np.multiply(
+                        rotated_psfs[j].T,
+                        planet_photon_flux[i, j],
+                    ).T
+            elif coro_type == "1dxo":
+                seps = (
+                    np.dot(plan_seps[i][:, None] * mas2rad, wave_inv[None]) * self.diam
+                )  # lambda/D
+                temp = np.sqrt(seps**2 - self.offax_psf_offset_y[0] ** 2)  # lambda/D
+                angs = np.rad2deg(np.arcsin(self.offax_psf_offset_y[0] / seps))  # deg
+                # temp = np.exp(self.ln_offax_psf_interp(temp))
+                temp = self.offax_psf_interp(temp)
+                for j in range(self.scene.Ntime):
+                    for k in range(self.scene.Nwave):
+                        temp[j, k] = np.exp(
+                            rotate(
+                                np.log(temp[j, k]),
+                                plan_angs[i, j] - 90.0 + angs[j, k],
+                                axes=(0, 1),
+                                reshape=False,
+                                mode="nearest",
+                                order=5,
+                            )
+                        )  # interpolate in log-space to avoid negative values
+                    temp[j] = np.multiply(
+                        temp[j].T, self.scene.fplanet[i, j] * self.oneJ_count_rate
+                    ).T  # ph/s
+            elif coro_type == "1dyo":
+                seps = (
+                    np.dot(plan_seps[i][:, None] * mas2rad, wave_inv[None]) * self.diam
+                )  # lambda/D
+                temp = np.sqrt(seps**2 - self.offax_psf_offset_x[0] ** 2)  # lambda/D
+                angs = np.rad2deg(np.arcsin(self.offax_psf_offset_x[0] / seps))  # deg
+                # temp = np.exp(self.ln_offax_psf_interp(temp))
+                temp = self.offax_psf_interp(temp)
+                for j in range(self.scene.Ntime):
+                    for k in range(self.scene.Nwave):
+                        temp[j, k] = np.exp(
+                            rotate(
+                                np.log(temp[j, k]),
+                                plan_angs[i, j] - 90.0 + angs[j, k],
+                                axes=(0, 1),
+                                reshape=False,
+                                mode="nearest",
+                                order=5,
+                            )
+                        )  # interpolate in log-space to avoid negative values
+                    temp[j] = np.multiply(
+                        temp[j].T, self.scene.fplanet[i, j] * self.oneJ_count_rate
+                    ).T  # ph/s
+            elif coro_type == "2dq":
+                temp = (
+                    np.dot(plan_offs[i][:, :, None] * mas2rad, wave_inv[None])
+                    * self.diam
+                )  # lambda/D
+                temp = np.swapaxes(temp, 1, 2)  # lambda/D
+                temp = temp[:, :, ::-1]  # lambda/D
+                offs = temp.copy()  # lambda/D
+                # temp = np.exp(self.ln_offax_psf_interp(np.abs(temp)))
+                temp = self.offax_psf_interp(np.abs(temp))
+                mask = offs[:, :, 0] < 0.0
+                temp[mask] = temp[mask, ::-1, :]
+                mask = offs[:, :, 1] < 0.0
+                temp[mask] = temp[mask, :, ::-1]
+                for j in range(self.scene.Ntime):
+                    temp[j] = np.multiply(
+                        temp[j].T, self.scene.fplanet[i, j] * self.oneJ_count_rate
+                    ).T  # ph/s
+            else:
+                temp = (
+                    np.dot(plan_offs[i][:, :, None] * mas2rad, wave_inv[None])
+                    * self.diam
+                )  # lambda/D
+                temp = np.swapaxes(temp, 1, 2)  # lambda/D
+                temp = temp[:, :, ::-1]  # lambda/D
+                # temp = np.exp(self.ln_offax_psf_interp(temp))
+                temp = self.offax_psf_interp(temp)
+                for j in range(self.scene.Ntime):
+                    temp[j] = np.multiply(
+                        temp[j].T, self.scene.fplanet[i, j] * self.oneJ_count_rate
+                    ).T  # ph/s
+            self.planet_count_rate += planet_images
+        self.images += self.planet_count_rate
+
+    def add_disk(self):
+        # Load data cube of spatially dependent PSFs.
+        disk_dir = Path(".cache/disks/")
+        if not disk_dir.exists():
+            disk_dir.mkdir(parents=True, exist_ok=True)
+        path = Path(
+            disk_dir,
+            self.coronagraph.dir.name + ".npy",
+        )
+        if path.exists():
+            psfs = np.load(path, allow_pickle=True)
+            print("Loaded data cube of spatially dependent PSFs")
+
+        # Compute data cube of spatially dependent PSFs.
+        else:
+            # Compute pixel grid.
+            # lambda/D
+            # ramp = ( np.arange(self.coronagraph.npixels) -
+            # ((self.coronagraph.npixels - 1) // 2)) * self.pixel_scale
+            pixel_lod = (
+                (
+                    np.arange(self.coronagraph.npixels)
+                    - ((self.coronagraph.npixels - 1) // 2)
+                )
+                * u.pixel
+                * self.coronagraph.pixel_scale
+            )
+
+            # lambda/D
+            # xx, yy = np.meshgrid(ramp, ramp)
+            x_lod, y_lod = np.meshgrid(pixel_lod, pixel_lod)
+
+            # lambda/D
+            # rr = np.sqrt(xx**2 + yy**2)
+            pixel_dist_lod = np.sqrt(x_lod**2 + y_lod**2)
+
+            # deg
+            # tt = np.rad2deg(np.arctan2(xx, yy))
+            pixel_angle = np.arctan2(x_lod, y_lod)
+
+            # Compute pixel grid contrast.
+            print("   Computing data cube of spatially dependent PSFs")
+            # psfs = np.zeros(
+            #     (rr.shape[0], rr.shape[1], self.img_pixels, self.img_pixels)
+            # )
+            psfs = np.zeros(
+                (
+                    pixel_dist_lod.shape[0],
+                    pixel_dist_lod.shape[1],
+                    self.coronagraph.npixels,
+                    self.coronagraph.npixels,
+                )
+            )
+            # Npsfs = np.prod(rr.shape)
+            npsfs = np.prod(pixel_dist_lod.shape)
+
+            pbar = tqdm(total=npsfs)
+            for i in range(pixel_dist_lod.shape[0]):
+                for j in range(pixel_dist_lod.shape[1]):
+                    pbar.update(1)
+                    if self.coronagraph.type == "1dx":
+                        temp = self.coronagraph.ln_offax_psf_interp(
+                            pixel_dist_lod[i, j]
+                        )
+                        # interpolate in log-space to avoid negative values
+                        temp = np.exp(
+                            rotate(
+                                temp,
+                                pixel_angle[i, j] - 90.0 * u.deg,
+                                reshape=False,
+                                mode="nearest",
+                                order=5,
+                            )
+                        )
+                    elif self.coronagraph.type == "1dy":
+                        temp = self.ln_offax_psf_interp(pixel_dist_lod[i, j])
+                        # interpolate in log-space to avoid negative values
+                        temp = np.exp(
+                            rotate(
+                                temp,
+                                pixel_angle[i, j],
+                                reshape=False,
+                                mode="nearest",
+                                order=5,
+                            )
+                        )
+                    elif self.coronagraph.type == "1dxo":
+                        temp = np.sqrt(
+                            pixel_dist_lod[i, j] ** 2 - self.offax_psf_offset_y[0] ** 2
+                        )  # lambda/D
+                        angs = np.rad2deg(
+                            np.arcsin(self.offax_psf_offset_y[0] / pixel_dist_lod[i, j])
+                        )  # deg
+                        temp = self.ln_offax_psf_interp(temp)
+                        # interpolate in log-space to avoid negative values
+                        temp = np.exp(
+                            rotate(
+                                temp,
+                                pixel_angle[i, j] - 90.0 + angs,
+                                reshape=False,
+                                mode="nearest",
+                                order=5,
+                            )
+                        )
+                    elif self.coronagraph.type == "1dyo":
+                        temp = np.sqrt(
+                            pixel_dist_lod[i, j] ** 2 - self.offax_psf_offset_x[0] ** 2
+                        )  # lambda/D
+                        angs = np.rad2deg(
+                            np.arcsin(self.offax_psf_offset_x[0] / pixel_dist_lod[i, j])
+                        )  # deg
+                        temp = self.ln_offax_psf_interp(temp)
+                        # interpolate in log-space to avoid negative values
+                        temp = np.exp(
+                            rotate(
+                                temp,
+                                pixel_angle[i, j] - angs,
+                                reshape=False,
+                                mode="nearest",
+                                order=5,
+                            )
+                        )
+                    elif self.coronagraph.type == "2dq":
+                        temp = np.array([y_lod[i, j], x_lod[i, j]])  # lambda/D
+                        # temp = np.exp(self.ln_offax_psf_interp(np.abs(temp))[0])
+                        temp = self.offax_psf_interp(np.abs(temp))[0]
+                        if y_lod[i, j] < 0.0:
+                            temp = temp[::-1, :]  # lambda/D
+                        if x_lod[i, j] < 0.0:
+                            temp = temp[:, ::-1]  # lambda/D
+                    else:
+                        temp = np.array([y_lod[i, j], x_lod[i, j]])  # lambda/D
+                        # temp = np.exp(self.ln_offax_psf_interp(temp)[0])
+                        temp = self.offax_psf_interp(temp)[0]
+                    psfs[i, j] = temp
+
+            # Save data cube of spatially dependent PSFs.
+            np.save(path, psfs, allow_pickle=True)
+
+        # Rotate disk so that North is in the direction of the position angle.
+
+        disk_image = self.system.disk.spec_flux_density(
+            self.obs_wavelengths, self.obs_times.decimalyear
+        )
+        disk_image_jy = disk_image.to(u.Jy).value
+
+        # diskimage = self.scene.disk.copy()  # Jy
+        if self.coronagraph.position_angle != 0.0 * u.deg:
+            # interpolate in log-space to avoid negative values
+            disk_image = (
+                np.exp(
+                    rotate(
+                        np.log(disk_image_jy),
+                        self.position_angle,
+                        axes=(3, 2),
+                        reshape=False,
+                        mode="nearest",
+                        order=5,
+                    )
+                )
+                * u.Jy
+            )
+            disk_image_jy = disk_image.to(u.Jy).value
+
+        # Scale disk to units of lambda/D.
+        # wave_inv = 1.0 / (self.scene.wave * 1e-6)  # 1/m
+        # lambda/D
+        # fact = self.scene.pixscale * mas2rad * wave_inv * self.diam / self.pixel_scale
+
+        # This is the factor to scale the disk image, from exovista, to the
+        # coronagraph model size since they do not necessarily have the same
+        # pixel scale
+        zoom_factor = (
+            (1 * u.pixel * self.system.star.pixel_scale.to(u.rad / u.pixel)).to(
+                lod, lod_eq(self.obs_wavelengths, self.diameter)
+            )
+            / self.coronagraph.pixel_scale
+        ).value
+        pbar = tqdm(total=self.ntimes * self.nwavelengths)
+        for j, wavelength in enumerate(self.obs_wavelengths):
+            # This is the photons per second
+            disk_image_photons = (
+                disk_image[:, j].to(
+                    u.photon / (u.m**2 * u.s * u.nm),
+                    equivalencies=u.spectral_density(wavelength),
+                )
+                * self.count_rate_term[j]
+            ).value
+            for i, _ in enumerate(self.obs_times):
+                pbar.update(1)
+                # interpolate in log-space to avoid negative values
+                # temp = np.exp(
+                #     zoom(np.log(diskimage[i, j]), fact[j], mode="nearest", order=5)
+                # )
+                # temp = temp / fact[j] ** 2
+                temp = np.exp(
+                    zoom(
+                        np.log(disk_image_photons[i]),
+                        zoom_factor[j],
+                        mode="nearest",
+                        order=5,
+                    )
+                )
+
+                # Center disk so that (img_pixels-1)/2 is center.
+                if (temp.shape[0] % 2 == 0) and (self.coronagraph.npixels % 2 != 0):
+                    temp = np.pad(temp, ((0, 1), (0, 1)), mode="edge")
+                    temp = np.exp(
+                        shift(np.log(temp), (0.5, 0.5), order=5)
+                    )  # interpolate in log-space to avoid negative values
+                    temp = temp[1:-1, 1:-1]
+                elif (temp.shape[0] % 2 != 0) and (self.coronagraph.npixels % 2 == 0):
+                    temp = np.pad(temp, ((0, 1), (0, 1)), mode="edge")
+                    temp = np.exp(
+                        shift(np.log(temp), (0.5, 0.5), order=5)
+                    )  # interpolate in log-space to avoid negative values
+                    temp = temp[1:-1, 1:-1]
+
+                # Crop disk to coronagraph model size.
+                if temp.shape[0] > self.coronagraph.npixels:
+                    nn = (temp.shape[0] - self.coronagraph.npixels) // 2
+                    temp = temp[nn:-nn, nn:-nn]
+                else:
+                    nn = (self.coronagraph.npixels - temp.shape[0]) // 2
+                    temp = np.pad(temp, ((nn, nn), (nn, nn)), mode="edge")
+                # disk[i, j] = util.tdot(temp, psfs)*u.ph/u.s
+                self.disk_count_rate[i, j] = np.tensordot(temp, psfs) * u.ph / u.s
+        self.images += self.disk_count_rate
+
+    def plot_images(self):
+        """
+        Plot the images at each wavelength and time
+        """
+        min_val = np.min(self.images.value * 1e-5)
+        max_val = np.max(self.images.value)
+        norm = LogNorm(vmin=min_val, vmax=max_val)
+        for i, time in enumerate(self.obs_times):
+            for j, wavelength in enumerate(self.obs_wavelengths):
+                fig, axes = plt.subplots(nrows=2, ncols=2, figsize=(8, 8))
+                data = [
+                    self.images[i, j],
+                    self.star_count_rate[i, j],
+                    self.planet_count_rate[i, j],
+                    self.disk_count_rate[i, j],
+                ]
+                names = ["Total", "Star", "Planet", "Disk"]
+                inclusion = [
+                    True,
+                    self.include_star,
+                    self.include_planets,
+                    self.include_disk,
+                ]
+                for ax, data, name, include in zip(
+                    axes.flatten(), data, names, inclusion
+                ):
+                    if include:
+                        ax.imshow(data.value, norm=norm)
+                        title = f"{name} count rate"
+                    else:
+                        title = f"{name} not included"
+
+                    ax.set_title(title)
+                    if ax.get_subplotspec().is_first_col():
+                        ax.set_ylabel("Pixels")
+                    if ax.get_subplotspec().is_last_row():
+                        ax.set_xlabel("Pixels")
+
+                # add colorbar of the LogNorm to the right of the figure
+                fig.subplots_adjust(right=0.8)
+                cax = fig.add_axes([0.85, 0.15, 0.05, 0.7])
+                fig.colorbar(
+                    mpl.cm.ScalarMappable(norm=norm), cax=cax, label="Photons/second"
+                )
+
+                fig.suptitle(
+                    f"{time.decimalyear:.2f} {wavelength.to(u.nm).value:.0f} nm"
+                )
+                save_path = Path(self.save_dir, "images")
+                if not save_path.exists():
+                    save_path.mkdir(parents=True, exist_ok=True)
+                fig.savefig(
+                    Path(
+                        save_path,
+                        f"{wavelength.to(u.nm).value:.0f}_{time.decimalyear:.2f}.png",
+                        bbox_inches="tight",
+                    )
+                )
+                plt.close(fig)
