@@ -4,7 +4,7 @@ import astropy.units as u
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
-from astroutils.units.lod import lod, lod_eq
+from lod_unit.lod_unit import lod, lod_eq
 from matplotlib.colors import LogNorm
 from scipy.ndimage import rotate, shift, zoom
 from tqdm import tqdm
@@ -186,7 +186,7 @@ class Observations:
             * self.count_rate_term
         ).decompose()
 
-        wave_inv = 1.0 / self.obs_wavelengths
+        # wave_inv = 1.0 / self.obs_wavelengths
         for i, planet in enumerate(tqdm(self.system.planets, desc="Adding planets")):
             if (coro_type == "1dx") or (coro_type == "1dy"):
                 # lambda/D
@@ -207,7 +207,7 @@ class Observations:
                     rotated_psfs[j] = np.exp(
                         rotate(
                             np.log(planet_psfs[j]),
-                            plan_angs[i, j] - 90.0,
+                            planet_angles[i, j] - 90.0 * u.deg,
                             axes=(1, 2),
                             reshape=False,
                             mode="nearest",
@@ -215,25 +215,33 @@ class Observations:
                         )
                     )
                     # ph/s
-                    # self.scene.fplanet[i, j] * self.oneJ_count_rate,
                     planet_images[j] = np.multiply(
                         rotated_psfs[j].T,
                         planet_photon_flux[i, j],
                     ).T
             elif coro_type == "1dxo":
+                planet_lod_alphas = np.stack(
+                    [
+                        planet_alphas[i, :].to(lod, lod_eq(wave, self.diameter))
+                        for wave in self.obs_wavelengths
+                    ]
+                )
+                temp = np.sqrt(
+                    planet_lod_alphas**2 - self.coronagraph.offax_psf_offset_y[0] ** 2
+                )
                 seps = (
                     np.dot(plan_seps[i][:, None] * mas2rad, wave_inv[None]) * self.diam
                 )  # lambda/D
-                temp = np.sqrt(seps**2 - self.offax_psf_offset_y[0] ** 2)  # lambda/D
-                angs = np.rad2deg(np.arcsin(self.offax_psf_offset_y[0] / seps))  # deg
-                # temp = np.exp(self.ln_offax_psf_interp(temp))
-                temp = self.offax_psf_interp(temp)
+                angs = np.arcsin(
+                    self.coronagraph.offax_psf_offset_y[0] / planet_lod_alphas
+                )
+                rotated_psfs = self.coronagraph.offax_psf_interp(temp)
                 for j in range(self.scene.Ntime):
                     for k in range(self.scene.Nwave):
                         temp[j, k] = np.exp(
                             rotate(
                                 np.log(temp[j, k]),
-                                plan_angs[i, j] - 90.0 + angs[j, k],
+                                plan_angs[i, j] - 90.0 * u.deg + angs[j, k],
                                 axes=(0, 1),
                                 reshape=False,
                                 mode="nearest",
@@ -356,97 +364,83 @@ class Observations:
             # Npsfs = np.prod(rr.shape)
             npsfs = np.prod(pixel_dist_lod.shape)
 
-            pbar = tqdm(total=npsfs)
+            pbar = tqdm(total=npsfs, desc="Computing datacube of PSFs at every pixel")
+
+            radially_symmetric_psf = "1d" in self.coronagraph.type
+            # Get the PSF (npixel, npixel) of a source at every pixel
             for i in range(pixel_dist_lod.shape[0]):
                 for j in range(pixel_dist_lod.shape[1]):
-                    pbar.update(1)
+                    # Basic structure here is to get the distance in lambda/D,
+                    # determine whether the psf has to be rotated (if the
+                    # coronagraph is defined in 1 dimension), evaluate
+                    # the offaxis psf at the distance, then rotate the
+                    # image
                     if self.coronagraph.type == "1dx":
-                        temp = self.coronagraph.ln_offax_psf_interp(
-                            pixel_dist_lod[i, j]
-                        )
-                        # interpolate in log-space to avoid negative values
-                        temp = np.exp(
-                            rotate(
-                                temp,
-                                pixel_angle[i, j] - 90.0 * u.deg,
-                                reshape=False,
-                                mode="nearest",
-                                order=5,
-                            )
-                        )
+                        psf_eval_dists = pixel_dist_lod[i, j]
+                        rotate_angle = pixel_angle[i, j] - 90.0 * u.deg
                     elif self.coronagraph.type == "1dy":
-                        temp = self.ln_offax_psf_interp(pixel_dist_lod[i, j])
-                        # interpolate in log-space to avoid negative values
-                        temp = np.exp(
-                            rotate(
-                                temp,
-                                pixel_angle[i, j],
-                                reshape=False,
-                                mode="nearest",
-                                order=5,
-                            )
-                        )
+                        psf_eval_dists = pixel_dist_lod[i, j]
+                        rotate_angle = pixel_angle[i, j]
                     elif self.coronagraph.type == "1dxo":
-                        temp = np.sqrt(
-                            pixel_dist_lod[i, j] ** 2 - self.offax_psf_offset_y[0] ** 2
-                        )  # lambda/D
-                        angs = np.rad2deg(
-                            np.arcsin(self.offax_psf_offset_y[0] / pixel_dist_lod[i, j])
-                        )  # deg
-                        temp = self.ln_offax_psf_interp(temp)
-                        # interpolate in log-space to avoid negative values
-                        temp = np.exp(
-                            rotate(
-                                temp,
-                                pixel_angle[i, j] - 90.0 + angs,
-                                reshape=False,
-                                mode="nearest",
-                                order=5,
+                        psf_eval_dists = np.sqrt(
+                            pixel_dist_lod[i, j] ** 2
+                            - self.coronagraph.offax_psf_offset_y[0] ** 2
+                        )
+                        rotate_angle = (
+                            pixel_angle[i, j]
+                            - 90 * u.deg
+                            + np.arcsin(
+                                self.coronagraph.offax_psf_offset_y[0]
+                                / pixel_dist_lod[i, j]
                             )
                         )
                     elif self.coronagraph.type == "1dyo":
-                        temp = np.sqrt(
-                            pixel_dist_lod[i, j] ** 2 - self.offax_psf_offset_x[0] ** 2
-                        )  # lambda/D
-                        angs = np.rad2deg(
-                            np.arcsin(self.offax_psf_offset_x[0] / pixel_dist_lod[i, j])
-                        )  # deg
-                        temp = self.ln_offax_psf_interp(temp)
-                        # interpolate in log-space to avoid negative values
+                        psf_eval_dists = np.sqrt(
+                            pixel_dist_lod[i, j] ** 2
+                            - self.coronagraph.offax_psf_offset_x[0] ** 2
+                        )
+                        rotate_angle = pixel_angle[i, j] - np.arcsin(
+                            self.coronagraph.offax_psf_offset_x[0]
+                            / pixel_dist_lod[i, j]
+                        )
+                    elif self.coronagraph.type == "2dq":
+                        # lambda/D
+                        temp = np.array([y_lod[i, j], x_lod[i, j]])
+                        psf = self.coronagraph.offax_psf_interp(np.abs(temp))[0]
+                        if y_lod[i, j] < 0.0:
+                            # lambda/D
+                            psf = psf[::-1, :]
+                        if x_lod[i, j] < 0.0:
+                            # lambda/D
+                            psf = psf[:, ::-1]
+                    else:
+                        # lambda/D
+                        temp = np.array([y_lod[i, j], x_lod[i, j]])
+                        psf = self.coronagraph.offax_psf_interp(temp)[0]
+
+                    if radially_symmetric_psf:
+                        psf = self.coronagraph.ln_offax_psf_interp(psf_eval_dists)
                         temp = np.exp(
                             rotate(
-                                temp,
-                                pixel_angle[i, j] - angs,
+                                psf,
+                                rotate_angle,
                                 reshape=False,
                                 mode="nearest",
                                 order=5,
                             )
                         )
-                    elif self.coronagraph.type == "2dq":
-                        temp = np.array([y_lod[i, j], x_lod[i, j]])  # lambda/D
-                        # temp = np.exp(self.ln_offax_psf_interp(np.abs(temp))[0])
-                        temp = self.offax_psf_interp(np.abs(temp))[0]
-                        if y_lod[i, j] < 0.0:
-                            temp = temp[::-1, :]  # lambda/D
-                        if x_lod[i, j] < 0.0:
-                            temp = temp[:, ::-1]  # lambda/D
-                    else:
-                        temp = np.array([y_lod[i, j], x_lod[i, j]])  # lambda/D
-                        # temp = np.exp(self.ln_offax_psf_interp(temp)[0])
-                        temp = self.offax_psf_interp(temp)[0]
                     psfs[i, j] = temp
+                    pbar.update(1)
 
             # Save data cube of spatially dependent PSFs.
             np.save(path, psfs, allow_pickle=True)
-
-        # Rotate disk so that North is in the direction of the position angle.
 
         disk_image = self.system.disk.spec_flux_density(
             self.obs_wavelengths, self.obs_times.decimalyear
         )
         disk_image_jy = disk_image.to(u.Jy).value
 
-        # diskimage = self.scene.disk.copy()  # Jy
+        # Rotate disk so that North is in the direction of the position angle.
         if self.coronagraph.position_angle != 0.0 * u.deg:
             # interpolate in log-space to avoid negative values
             disk_image = (
@@ -464,11 +458,6 @@ class Observations:
             )
             disk_image_jy = disk_image.to(u.Jy).value
 
-        # Scale disk to units of lambda/D.
-        # wave_inv = 1.0 / (self.scene.wave * 1e-6)  # 1/m
-        # lambda/D
-        # fact = self.scene.pixscale * mas2rad * wave_inv * self.diam / self.pixel_scale
-
         # This is the factor to scale the disk image, from exovista, to the
         # coronagraph model size since they do not necessarily have the same
         # pixel scale
@@ -478,7 +467,10 @@ class Observations:
             )
             / self.coronagraph.pixel_scale
         ).value
-        pbar = tqdm(total=self.ntimes * self.nwavelengths)
+        pbar = tqdm(
+            total=self.ntimes * self.nwavelengths,
+            desc="Convolving PSF datacube with the disk to create images of the disk",
+        )
         for j, wavelength in enumerate(self.obs_wavelengths):
             # This is the photons per second
             disk_image_photons = (
@@ -489,13 +481,7 @@ class Observations:
                 * self.count_rate_term[j]
             ).value
             for i, _ in enumerate(self.obs_times):
-                pbar.update(1)
-                # interpolate in log-space to avoid negative values
-                # temp = np.exp(
-                #     zoom(np.log(diskimage[i, j]), fact[j], mode="nearest", order=5)
-                # )
-                # temp = temp / fact[j] ** 2
-                temp = np.exp(
+                scaled_disk = np.exp(
                     zoom(
                         np.log(disk_image_photons[i]),
                         zoom_factor[j],
@@ -505,28 +491,27 @@ class Observations:
                 )
 
                 # Center disk so that (img_pixels-1)/2 is center.
-                if (temp.shape[0] % 2 == 0) and (self.coronagraph.npixels % 2 != 0):
-                    temp = np.pad(temp, ((0, 1), (0, 1)), mode="edge")
-                    temp = np.exp(
-                        shift(np.log(temp), (0.5, 0.5), order=5)
-                    )  # interpolate in log-space to avoid negative values
-                    temp = temp[1:-1, 1:-1]
-                elif (temp.shape[0] % 2 != 0) and (self.coronagraph.npixels % 2 == 0):
-                    temp = np.pad(temp, ((0, 1), (0, 1)), mode="edge")
-                    temp = np.exp(
-                        shift(np.log(temp), (0.5, 0.5), order=5)
-                    )  # interpolate in log-space to avoid negative values
-                    temp = temp[1:-1, 1:-1]
+                disk_pixels_is_even = scaled_disk.shape[0] % 2 == 0
+                coro_pixels_is_even = self.coronagraph.npixels % 2 == 0
+                if disk_pixels_is_even != coro_pixels_is_even:
+                    scaled_disk = np.pad(scaled_disk, ((0, 1), (0, 1)), mode="edge")
+                    # interpolate in log-space to avoid negative values
+                    scaled_disk = np.exp(
+                        shift(np.log(scaled_disk), (0.5, 0.5), order=5)
+                    )
+                    scaled_disk = scaled_disk[1:-1, 1:-1]
 
                 # Crop disk to coronagraph model size.
-                if temp.shape[0] > self.coronagraph.npixels:
-                    nn = (temp.shape[0] - self.coronagraph.npixels) // 2
-                    temp = temp[nn:-nn, nn:-nn]
+                if scaled_disk.shape[0] > self.coronagraph.npixels:
+                    nn = (scaled_disk.shape[0] - self.coronagraph.npixels) // 2
+                    scaled_disk = scaled_disk[nn:-nn, nn:-nn]
                 else:
-                    nn = (self.coronagraph.npixels - temp.shape[0]) // 2
-                    temp = np.pad(temp, ((nn, nn), (nn, nn)), mode="edge")
-                # disk[i, j] = util.tdot(temp, psfs)*u.ph/u.s
-                self.disk_count_rate[i, j] = np.tensordot(temp, psfs) * u.ph / u.s
+                    nn = (self.coronagraph.npixels - scaled_disk.shape[0]) // 2
+                    scaled_disk = np.pad(scaled_disk, ((nn, nn), (nn, nn)), mode="edge")
+                self.disk_count_rate[i, j] = (
+                    np.tensordot(scaled_disk, psfs) * u.ph / u.s
+                )
+                pbar.update(1)
         self.images += self.disk_count_rate
 
     def plot_images(self):

@@ -4,7 +4,7 @@ import astropy.io.fits as pyfits
 import astropy.units as u
 import matplotlib.pyplot as plt
 import numpy as np
-from astroutils.units.lod import lod
+from lod_unit.lod_unit import lod
 from scipy.interpolate import RegularGridInterpolator, interp1d
 from scipy.ndimage import zoom
 
@@ -88,11 +88,15 @@ class Coronagraph:
         self.offax_psf_offset_x = np.unique(self.offax_psf_offset_list[:, 0])
         self.offax_psf_offset_y = np.unique(self.offax_psf_offset_list[:, 1])
 
-        if (len(self.offax_psf_offset_x) == 1) and (self.offax_psf_offset_x[0] == 0):
+        if (len(self.offax_psf_offset_x) == 1) and (
+            self.offax_psf_offset_x[0] == 0 * lod
+        ):
             self.type = "1dy"
             self.offax_psf_base_angle = 90.0 * u.deg
             print(f"Radially symmetric response --> rotating PSFs ({self.type})")
-        elif (len(self.offax_psf_offset_y) == 1) and (self.offax_psf_offset_y[0] == 0):
+        elif (len(self.offax_psf_offset_y) == 1) and (
+            self.offax_psf_offset_y[0] == 0 * lod
+        ):
             self.type = "1dx"
             self.offax_psf_base_angle = 0.0 * u.deg
             print(f"Radially symmetric response --> rotating PSFs ({self.type})")
@@ -104,7 +108,7 @@ class Coronagraph:
             self.type = "1dxo"
             self.offax_psf_base_angle = 0.0 * u.deg
             print(f"Radially symmetric response --> rotating PSFs ({self.type})")
-        elif np.min(self.offax_psf_offset_list) >= 0:
+        elif np.min(self.offax_psf_offset_list) >= 0 * lod:
             self.type = "2dq"
             self.offax_psf_base_angle = 0.0 * u.deg
             print(f"Quarterly symmetric response --> reflecting PSFs ({self.type})")
