@@ -1,3 +1,4 @@
+from itertools import product
 from pathlib import Path
 
 import astropy.units as u
@@ -30,20 +31,26 @@ class Observations:
         self.diameter = self.observing_scenario["diameter"]
         self.obs_wavelengths = self.observing_scenario["wavelengths"]
         self.obs_times = self.observing_scenario["times"]
+        self.exposure_time = self.observing_scenario["exposure_time"]
+        self.frame_time = self.observing_scenario["frame_time"]
+        self.frame_resolution = self.observing_scenario["frame_resolution"]
         self.nwavelengths = len(self.obs_wavelengths)
         self.ntimes = len(self.obs_times)
 
         self.include_star = self.observing_scenario.get("include_star")
         self.include_planets = self.observing_scenario.get("include_planets")
         self.include_disk = self.observing_scenario.get("include_disk")
+        self.include_shot_noise = self.observing_scenario.get("include_shot_noise")
 
         # Create save directory
         self.save_dir = Path("results", system.file.stem, coronagraph.dir.parts[-1])
 
         # Create the images
         self.create_count_rate_factor()
-        self.create_images()
-        self.plot_images()
+        self.create_count_rates()
+        self.plot_count_rates()
+        if self.include_shot_noise:
+            self.add_shot_noise()
 
     def create_count_rate_factor(self):
         self.throughput = np.repeat(
@@ -58,12 +65,12 @@ class Observations:
         )
         self.count_rate_term = self.illuminated_area * self.bandwidths * self.throughput
 
-    def create_images(self):
+    def create_count_rates(self):
         """
         Create the images at the wavelengths and times
         """
 
-        self.images = (
+        self.count_rates = (
             np.zeros(
                 (
                     self.ntimes,
@@ -76,17 +83,17 @@ class Observations:
             / u.s
         )
 
-        self.star_count_rate = np.zeros_like(self.images.value) * u.ph / u.s
-        self.planet_count_rate = np.zeros_like(self.images.value) * u.ph / u.s
-        self.disk_count_rate = np.zeros_like(self.images.value) * u.ph / u.s
+        self.star_count_rate = np.zeros_like(self.count_rates.value) * u.ph / u.s
+        self.planet_count_rate = np.zeros_like(self.count_rates.value) * u.ph / u.s
+        self.disk_count_rate = np.zeros_like(self.count_rates.value) * u.ph / u.s
         if self.include_star:
-            self.add_star()
+            self.add_star_count_rate()
         if self.include_planets:
-            self.add_planets()
+            self.add_planets_count_rate()
         if self.include_disk:
-            self.add_disk()
+            self.add_disk_count_rate()
 
-    def add_star(self):
+    def add_star_count_rate(self):
         """
         Add a star to the system.
         """
@@ -112,9 +119,9 @@ class Observations:
         # Compute star count rate in each pixel
         for i, _ in enumerate(self.obs_times):
             self.star_count_rate[i] = np.multiply(stellar_intens, flux_term[i]).T
-        self.images += self.star_count_rate
+        self.count_rates += self.star_count_rate
 
-    def add_planets(self):
+    def add_planets_count_rate(self):
         """
         Add planets to the system.
         """
@@ -306,9 +313,9 @@ class Observations:
                         temp[j].T, self.scene.fplanet[i, j] * self.oneJ_count_rate
                     ).T  # ph/s
             self.planet_count_rate += planet_images
-        self.images += self.planet_count_rate
+        self.count_rates += self.planet_count_rate
 
-    def add_disk(self):
+    def add_disk_count_rate(self):
         # Load data cube of spatially dependent PSFs.
         disk_dir = Path(".cache/disks/")
         if not disk_dir.exists():
@@ -512,20 +519,104 @@ class Observations:
                     np.tensordot(scaled_disk, psfs) * u.ph / u.s
                 )
                 pbar.update(1)
-        self.images += self.disk_count_rate
+        self.count_rates += self.disk_count_rate
 
-    def plot_images(self):
+    def add_shot_noise(self):
+        """
+        Split count rates into frames and add read noise
+        """
+
+        partial_frame, full_frames = np.modf(
+            (self.exposure_time / self.frame_time).decompose().value
+        )
+        if partial_frame != 0:
+            print("Warning! Partial frames are not implemented yet!")
+        nframes = int(full_frames)
+        pbar0 = tqdm(
+            position=0,
+            total=self.ntimes * self.nwavelengths,
+            desc="Processing exposure times",
+        )
+        pbar1 = tqdm(
+            position=1,
+            total=nframes * self.frame_resolution,
+            desc="Adding shot noise",
+        )
+        for j, k in product(range(self.ntimes), range(self.nwavelengths)):
+            shot_noise = np.zeros(
+                (
+                    nframes,
+                    self.frame_resolution,
+                    self.coronagraph.npixels,
+                    self.coronagraph.npixels,
+                )
+            )
+            expected_photons_per_frame = (
+                (self.count_rates[j, k] * self.frame_time).decompose().value
+            )
+            expected_photons_per_timestep = (
+                expected_photons_per_frame / self.frame_resolution
+            )
+            for i in range(nframes):
+                for ii in range(self.frame_resolution):
+                    timestep_frame = np.random.poisson(expected_photons_per_timestep)
+                    shot_noise[i, ii] = timestep_frame
+                    pbar1.update(1)
+            frames = np.sum(shot_noise, axis=1)
+            full_img = np.sum(frames, axis=0)
+            # mean_shot_noise = np.mean(shot_noise, axis=1)
+            # std_dev_shot_noise = np.std(shot_noise, axis=1)
+            # fig, (ax_img, ax_val) = plt.subplots(ncols=2, figsize=(12, 6))
+            # ax_val.scatter(
+            #     np.sqrt(mean_shot_noise).flatten(),
+            #     std_dev_shot_noise.flatten(),
+            #     label="Generated data (per pixel)",
+            # )
+            # ax_val.set_xlabel("Sqrt of mean of count (per pixel)")
+            # ax_val.set_ylabel("Standard deviation of count (per pixel)")
+            # # Add linear fit of the data
+            # a, b = np.polyfit(
+            #     np.sqrt(mean_shot_noise).flatten(), std_dev_shot_noise.flatten(), 1
+            # )
+            # ax_val.plot(
+            #     np.sqrt(mean_shot_noise).flatten(),
+            #     a * np.sqrt(mean_shot_noise).flatten() + b,
+            #     "r",
+            #     label=f"Linear fit to data, slope = {a:.2f}, offset={b:.2f}",
+            # )
+            # ax_val.legend()
+
+            # p = ax_img.imshow(full_img, norm=LogNorm())
+            # ax_img.set_title("Generated image")
+
+            # # ax_img.colorbar(p)
+            # plt.savefig(
+            #     "results/validation/shot_noise.png", bbox_inches="tight", dpi=300
+            # )
+            # plt.show()
+            # plt.close()
+            pbar0.update(1)
+            pbar1.reset()
+        img_frames = np.zeros(
+            (
+                nframes,
+                self.coronagraph.npixels,
+                self.coronagraph.npixels,
+            )
+        )
+
+    def plot_count_rates(self):
         """
         Plot the images at each wavelength and time
         """
-        min_val = np.min(self.images.value * 1e-5)
-        max_val = np.max(self.images.value)
+        min_val = np.min(self.count_rates.value * 1e-5)
+        max_val = np.max(self.count_rates.value)
         norm = LogNorm(vmin=min_val, vmax=max_val)
         for i, time in enumerate(self.obs_times):
             for j, wavelength in enumerate(self.obs_wavelengths):
                 fig, axes = plt.subplots(nrows=2, ncols=2, figsize=(8, 8))
                 data = [
-                    self.images[i, j],
+                    self.count_rates[i, j],
                     self.star_count_rate[i, j],
                     self.planet_count_rate[i, j],
                     self.disk_count_rate[i, j],
@@ -562,13 +653,18 @@ class Observations:
                 fig.suptitle(
                     f"{time.decimalyear:.2f} {wavelength.to(u.nm).value:.0f} nm"
                 )
-                save_path = Path(self.save_dir, "images")
+                save_path = Path(
+                    self.save_dir,
+                    f"{wavelength.to(u.nm).value:.0f}"
+                    # , "images"
+                )
                 if not save_path.exists():
                     save_path.mkdir(parents=True, exist_ok=True)
                 fig.savefig(
                     Path(
                         save_path,
-                        f"{wavelength.to(u.nm).value:.0f}_{time.decimalyear:.2f}.png",
+                        # f"{wavelength.to(u.nm).value:.0f}_{time.decimalyear:.2f}.png",
+                        f"{i:003}.png",
                         bbox_inches="tight",
                     )
                 )
