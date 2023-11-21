@@ -28,19 +28,19 @@ class Observations:
         self.observing_scenario = observing_scenario
 
         # Load observing scenario parameters
-        self.diameter = self.observing_scenario["diameter"]
-        self.obs_wavelengths = self.observing_scenario["wavelengths"]
-        self.obs_times = self.observing_scenario["times"]
-        self.exposure_time = self.observing_scenario["exposure_time"]
-        self.frame_time = self.observing_scenario["frame_time"]
-        self.frame_resolution = self.observing_scenario["frame_resolution"]
+        self.diameter = self.observing_scenario.scenario["diameter"]
+        self.obs_wavelengths = self.observing_scenario.scenario["wavelengths"]
+        self.obs_times = self.observing_scenario.scenario["times"]
+        self.exposure_time = self.observing_scenario.scenario["exposure_time"]
+        self.frame_time = self.observing_scenario.scenario["frame_time"]
+        # self.frame_resolution = self.observing_scenario["frame_resolution"]
         self.nwavelengths = len(self.obs_wavelengths)
         self.ntimes = len(self.obs_times)
 
-        self.include_star = self.observing_scenario.get("include_star")
-        self.include_planets = self.observing_scenario.get("include_planets")
-        self.include_disk = self.observing_scenario.get("include_disk")
-        self.include_shot_noise = self.observing_scenario.get("include_shot_noise")
+        self.include_star = self.observing_scenario.scenario.get("include_star")
+        self.include_planets = self.observing_scenario.scenario.get("include_planets")
+        self.include_disk = self.observing_scenario.scenario.get("include_disk")
+        # self.include_photon_noise = self.observing_scenario.get("include_photon_noise")
 
         # Create save directory
         self.save_dir = Path("results", system.file.stem, coronagraph.dir.parts[-1])
@@ -48,9 +48,9 @@ class Observations:
         # Create the images
         self.create_count_rate_factor()
         self.create_count_rates()
-        self.plot_count_rates()
-        if self.include_shot_noise:
-            self.add_shot_noise()
+        # self.plot_count_rates()
+        # if self.include_photon_noise:
+        self.count_photons()
 
     def create_count_rate_factor(self):
         self.throughput = np.repeat(
@@ -521,9 +521,10 @@ class Observations:
                 pbar.update(1)
         self.count_rates += self.disk_count_rate
 
-    def add_shot_noise(self):
+    def count_photons(self):
         """
-        Split count rates into frames and add read noise
+        Split the exposure time into individual frames, then simulate the
+        collection of photons as a Poisson process
         """
 
         partial_frame, full_frames = np.modf(
@@ -539,14 +540,14 @@ class Observations:
         )
         pbar1 = tqdm(
             position=1,
-            total=nframes * self.frame_resolution,
-            desc="Adding shot noise",
+            total=nframes,
+            desc="Adding photon noise",
         )
+        self.images = {}
         for j, k in product(range(self.ntimes), range(self.nwavelengths)):
-            shot_noise = np.zeros(
+            frame_counts = np.zeros(
                 (
                     nframes,
-                    self.frame_resolution,
                     self.coronagraph.npixels,
                     self.coronagraph.npixels,
                 )
@@ -554,46 +555,47 @@ class Observations:
             expected_photons_per_frame = (
                 (self.count_rates[j, k] * self.frame_time).decompose().value
             )
-            expected_photons_per_timestep = (
-                expected_photons_per_frame / self.frame_resolution
-            )
             for i in range(nframes):
-                for ii in range(self.frame_resolution):
-                    timestep_frame = np.random.poisson(expected_photons_per_timestep)
-                    shot_noise[i, ii] = timestep_frame
-                    pbar1.update(1)
-            frames = np.sum(shot_noise, axis=1)
-            full_img = np.sum(frames, axis=0)
-            # mean_shot_noise = np.mean(shot_noise, axis=1)
-            # std_dev_shot_noise = np.std(shot_noise, axis=1)
-            # fig, (ax_img, ax_val) = plt.subplots(ncols=2, figsize=(12, 6))
+                frame = np.random.poisson(expected_photons_per_frame)
+                frame_counts[i] = frame
+                pbar1.update(1)
+            full_img = np.sum(frame_counts, axis=0)
+            self.images[
+                (
+                    self.obs_times[j],
+                    self.obs_wavelengths[k],
+                )
+            ] = full_img
+            # mean_photon_noise = np.mean(frame_counts, axis=0)
+            # std_dev_photon_noise = np.std(frame_counts, axis=0)
+            # _, (ax_img, ax_val) = plt.subplots(ncols=2, figsize=(12, 6))
             # ax_val.scatter(
-            #     np.sqrt(mean_shot_noise).flatten(),
-            #     std_dev_shot_noise.flatten(),
+            #     np.sqrt(mean_photon_noise).flatten(),
+            #     std_dev_photon_noise.flatten(),
             #     label="Generated data (per pixel)",
             # )
             # ax_val.set_xlabel("Sqrt of mean of count (per pixel)")
             # ax_val.set_ylabel("Standard deviation of count (per pixel)")
             # # Add linear fit of the data
             # a, b = np.polyfit(
-            #     np.sqrt(mean_shot_noise).flatten(), std_dev_shot_noise.flatten(), 1
+            #     np.sqrt(mean_photon_noise).flatten(), std_dev_photon_noise.flatten(), 1
             # )
             # ax_val.plot(
-            #     np.sqrt(mean_shot_noise).flatten(),
-            #     a * np.sqrt(mean_shot_noise).flatten() + b,
+            #     np.sqrt(mean_photon_noise).flatten(),
+            #     a * np.sqrt(mean_photon_noise).flatten() + b,
             #     "r",
             #     label=f"Linear fit to data, slope = {a:.2f}, offset={b:.2f}",
             # )
             # ax_val.legend()
 
-            # p = ax_img.imshow(full_img, norm=LogNorm())
+            # ax_img.imshow(full_img, norm=LogNorm())
             # ax_img.set_title("Generated image")
 
-            # # ax_img.colorbar(p)
             # plt.savefig(
-            #     "results/validation/shot_noise.png", bbox_inches="tight", dpi=300
+            #     f"results/validation/photon_noise_{j}_{k}.png",
+            #     bbox_inches="tight",
+            #     dpi=300,
             # )
-            # plt.show()
             # plt.close()
             pbar0.update(1)
             pbar1.reset()

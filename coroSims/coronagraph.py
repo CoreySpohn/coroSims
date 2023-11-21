@@ -45,6 +45,7 @@ class Coronagraph:
             print("Initializing coronagraph...")
 
         dir = Path(dir)
+        self.name = dir.stem
         # Get header and calculate the lambda/D value
         stellar_intens_header = pyfits.getheader(Path(dir, "stellar_intens_1.fits"), 0)
 
